@@ -1,8 +1,9 @@
 # ============= TRADING CONFIG =============
-EPIC = "CS.D.IN_GOLD.MFI.IP"  # IG Markets Gold (XAU/USD)
-SIZE = 0.1  # Standard lot size
-STOP_LOSS_PCT = 2.0  # 2% stop loss
-TAKE_PROFIT_PCT = 3.0  # 3% take profit
+# Default asset: Gold (XAU/USD)
+EPIC = "CS.D.IN_GOLD.MFI.IP"
+SIZE = 0.1
+STOP_LOSS_PCT = 2.0
+TAKE_PROFIT_PCT = 3.0
 
 # ============= AGENT CONFIG =============
 STATE_SIZE = 18  # Feature vector size (from FeatureExtractor)

@@ -465,6 +465,6 @@ test: Add unit tests for DQN
 
 ---
 
-**Last Updated**: 2024  
+**Last Updated**: 2026
 **Maintainer**: Hybrid Trading System  
 **Status**: Active Development
