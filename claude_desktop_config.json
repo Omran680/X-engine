@@ -1,0 +1,10 @@
+{
+  "_comment": "Ajoute ce bloc dans ~/.claude/claude_desktop_config.json sous 'mcpServers'",
+  "mcpServers": {
+    "trade-bot": {
+      "command": "/Users/m28gb512gbcycle90health93/Desktop/dossier sans titre/dossier sans titre/trade-bot/.venv/bin/python",
+      "args": ["-m", "mcp_server.server"],
+      "cwd": "/Users/m28gb512gbcycle90health93/Desktop/dossier sans titre/dossier sans titre/trade-bot"
+    }
+  }
+}
