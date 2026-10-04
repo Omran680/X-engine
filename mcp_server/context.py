@@ -15,6 +15,9 @@ from typing import Optional
 # Allow importing project modules from parent directory
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from typing import Callable
+
+from trade_bot.core.config import MAX_ORDER_SIZE, RISK_INITIAL_CAPITAL
 from trade_bot.execution import Trader
 from trade_bot.execution.risk import PortfolioRiskManager
 from trade_bot.agents.scalping import ScalpingAgent
@@ -31,7 +34,7 @@ class BotContext:
     """
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._trader: Optional[Trader] = None
         self._risk_manager: Optional[PortfolioRiskManager] = None
 
@@ -45,6 +48,10 @@ class BotContext:
         self.training_mode: bool = True
         self.bot_running: bool = False
         self.start_time: float = time.time()
+        self.dry_run: bool = False
+        self.market_open: bool = True
+        # Set by the running bot so MCP can persist the *live* weights
+        self.save_models_fn: Optional[Callable[[], None]] = None
 
         # Scalping agent — shared with the main trading loop
         self.scalping: ScalpingAgent = ScalpingAgent()
@@ -61,7 +68,7 @@ class BotContext:
         except Exception as e:
             logger.warning("BotContext: Trader init failed — read-only mode: %s", e)
 
-        self._risk_manager = PortfolioRiskManager(initial_capital=10_000)
+        self._risk_manager = PortfolioRiskManager(initial_capital=RISK_INITIAL_CAPITAL)
 
     # ------------------------------------------------------------------
     # READ helpers (no side effects)
@@ -96,6 +103,8 @@ class BotContext:
         uptime = int(time.time() - self.start_time)
         return {
             "bot_running":    self.bot_running,
+            "market_open":    self.market_open,
+            "dry_run":        self.dry_run,
             "step":           self.step,
             "last_price":     self.last_price,
             "last_action":    ["BUY", "SELL", "HOLD"][self.last_action],
@@ -107,9 +116,8 @@ class BotContext:
         }
 
     def get_scalp_signal(self, prices: list, volumes: list | None = None) -> dict:
-        """Evaluate and return the latest scalping signal (read-only)."""
-        signal = self.scalping.evaluate(prices, volumes or [])
-        return signal.to_dict()
+        """Compute a scalping signal for the given bars — pure, mutates nothing."""
+        return self.scalping.preview(prices, volumes).to_dict()
 
     def get_scalp_status(self) -> dict:
         return self.scalping.get_status()
@@ -121,14 +129,20 @@ class BotContext:
                    sl: float | None = None, tp: float | None = None) -> dict:
         if self._trader is None:
             raise RuntimeError("Trader not connected")
+        if not 0 < size <= MAX_ORDER_SIZE:
+            raise ValueError(f"size {size} outside (0, {MAX_ORDER_SIZE}] lots")
         with self._lock:
+            allowed, reason = self._risk_manager.check_trade_allowed(
+                size * (sl if sl else self.last_price * 0.002))
+            if not allowed:
+                raise RuntimeError(f"Risk manager rejected the order: {reason}")
             result = self._trader.open_trade(epic, direction, size, sl, tp)
             self.has_position = True
             self.position = {
                 "direction":   direction,
                 "entry_price": self.last_price,
                 "size":        size,
-                "deal_id":     result.get("dealReference"),
+                "deal_id":     result.get("dealId") or result.get("dealReference"),
             }
             return result
 
@@ -149,6 +163,13 @@ class BotContext:
         with self._lock:
             self.bot_running = False
 
+    def save_models(self) -> str:
+        """Persist the live agent's weights (needs a running bot)."""
+        if self.save_models_fn is None:
+            raise RuntimeError("No live agent attached — start the bot with launch.py to save weights")
+        self.save_models_fn()
+        return "saved"
+
     # ── Scalping exec ──────────────────────────────────────────────────
     def enable_scalping(self, enabled: bool) -> None:
         with self._lock:
@@ -163,12 +184,23 @@ class BotContext:
         with self._lock:
             if not self.scalping.has_position():
                 return None
+            if self.last_price <= 0:
+                raise RuntimeError("No live price yet — cannot compute exit")
             result = self.scalping.force_exit(self.last_price)
             # Close on the exchange unless dry-run
+            dry_run = dry_run or self.dry_run
             if not dry_run and result and result.get("deal_id") and result["deal_id"] != "dry_run":
                 try:
                     self._trader.close_position(result["deal_id"])
                 except Exception as e:
                     logger.error("scalp_force_exit exchange close failed: %s", e)
                     result["exchange_error"] = str(e)
+            if result:
+                self.record_closed_trade(result["pnl_pct"] / 100, result.get("size", 0.0),
+                                         result["entry_price"])
             return result
+
+    def record_closed_trade(self, pnl_frac: float, size: float, entry_price: float) -> None:
+        """Feed a closed trade into the risk manager (PnL ≈ return × entry × size)."""
+        if self._risk_manager is not None:
+            self._risk_manager.update_pnl(pnl_frac * entry_price * size)

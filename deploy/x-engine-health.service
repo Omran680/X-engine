@@ -1,0 +1,9 @@
+# /etc/systemd/system/x-engine-health.service — restarts the bot if its heartbeat is stale (hung process).
+# Runs as root (needs `systemctl restart`); only acts when the bot service is supposed to be running.
+[Unit]
+Description=X-engine watchdog
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/x-engine
+ExecStart=/bin/sh -c 'systemctl is-active --quiet x-engine || exit 0; sudo -u xengine /opt/x-engine/.venv/bin/python healthcheck.py 600 || systemctl restart x-engine'

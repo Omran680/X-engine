@@ -1,5 +1,10 @@
+import threading
+from datetime import date
+
 import numpy as np
 from typing import Tuple, Dict, List
+
+from trade_bot.core.config import MAX_CONSECUTIVE_LOSSES, MAX_DAILY_LOSS_PCT
 
 class PortfolioRiskManager:
     """Gestion de risque pour le portefeuille de trading"""
@@ -14,16 +19,41 @@ class PortfolioRiskManager:
         self.current_capital = initial_capital
         self.max_risk_per_trade = max_risk_per_trade
         
-        # Tracking
+        # Tracking (daily_pnl / daily_trades hold one entry per closed trade, all days)
         self.daily_pnl = []
         self.daily_trades = []
         self.max_drawdown = 0
         self.peak_capital = initial_capital
-        
+
+        # Per-day state — reset automatically at the date rollover
+        self._lock = threading.Lock()
+        self._today: date = date.today()
+        self._today_pnl: float = 0.0
+        self._day_start_capital: float = initial_capital
+
         # Risk limits
-        self.max_daily_loss_pct = 0.05  # 5% max daily loss
-        self.max_consecutive_losses = 3
+        self.max_daily_loss_pct = MAX_DAILY_LOSS_PCT
+        self.max_consecutive_losses = MAX_CONSECUTIVE_LOSSES
         self.consecutive_losses = 0
+
+    def _roll_day(self) -> None:
+        """Reset the daily counters when the calendar day changes.
+
+        Without this the 'max consecutive losses' lock-out was permanent: a bot
+        that is not allowed to trade can never record the win that clears it.
+        """
+        today = date.today()
+        if today != self._today:
+            self._today = today
+            self._today_pnl = 0.0
+            self._day_start_capital = self.current_capital
+            self.consecutive_losses = 0
+
+    @property
+    def today_pnl(self) -> float:
+        with self._lock:
+            self._roll_day()
+            return self._today_pnl
 
     def calculate_position_size(self, 
                                entry_price: float, 
@@ -46,7 +76,7 @@ class PortfolioRiskManager:
         risk_per_unit = abs(entry_price - stop_loss_price)
         
         if risk_per_unit == 0:
-            return 0.1  # Minimum lot
+            return 0.01  # Degenerate stop — smallest lot rather than a 10x-minimum guess
         
         position_size = risk_amount / risk_per_unit
         
@@ -90,68 +120,58 @@ class PortfolioRiskManager:
         Returns:
             (allowed: bool, reason: str)
         """
-        # Check daily loss limit
-        daily_loss = sum(self.daily_pnl[-1:]) if self.daily_pnl else 0
-        if daily_loss + expected_loss < -self.current_capital * self.max_daily_loss_pct:
-            return False, "Daily loss limit reached"
-        
-        # Check consecutive losses
-        if self.consecutive_losses >= self.max_consecutive_losses:
-            return False, "Max consecutive losses reached"
-        
-        # Check capital preservation
-        if self.current_capital < self.initial_capital * 0.5:
-            return False, "Capital below 50% threshold"
-        
+        with self._lock:
+            self._roll_day()
+
+            # Today's realised PnL plus the worst case of the new trade
+            # (expected_loss is a positive amount at risk).
+            limit = -self._day_start_capital * self.max_daily_loss_pct
+            if self._today_pnl - abs(expected_loss) < limit:
+                return False, "Daily loss limit reached"
+
+            if self.consecutive_losses >= self.max_consecutive_losses:
+                return False, "Max consecutive losses reached"
+
+            if self.current_capital < self.initial_capital * 0.5:
+                return False, "Capital below 50% threshold"
+
         return True, "Trade allowed"
 
     def update_pnl(self, pnl: float):
         """Mettre à jour PnL"""
-        self.current_capital += pnl
-        self.daily_pnl.append(pnl)
-        self.daily_trades.append(1)
-        
-        # Update consecutive losses
-        if pnl < 0:
-            self.consecutive_losses += 1
-        else:
-            self.consecutive_losses = 0
-        
-        # Update max drawdown
-        if self.current_capital > self.peak_capital:
-            self.peak_capital = self.current_capital
-        
-        drawdown = (self.peak_capital - self.current_capital) / self.peak_capital
-        if drawdown > self.max_drawdown:
-            self.max_drawdown = drawdown
+        with self._lock:
+            self._roll_day()
+            self.current_capital += pnl
+            self._today_pnl += pnl
+            self.daily_pnl.append(pnl)
+            self.daily_trades.append(1)
 
-    def calculate_trailing_stop(self, 
-                               entry_price: float, 
+            if pnl < 0:
+                self.consecutive_losses += 1
+            else:
+                self.consecutive_losses = 0
+
+            if self.current_capital > self.peak_capital:
+                self.peak_capital = self.current_capital
+
+            drawdown = (self.peak_capital - self.current_capital) / self.peak_capital
+            if drawdown > self.max_drawdown:
+                self.max_drawdown = drawdown
+
+    def calculate_trailing_stop(self,
+                               entry_price: float,
                                current_price: float,
-                               trailing_stop_pct: float = 1.0) -> float:
+                               trailing_stop_pct: float = 1.0,
+                               direction: str = "BUY") -> float:
+        """Trailing stop for a BUY (default) or SELL position.
+
+        The stop starts ``trailing_stop_pct`` from entry and then follows price
+        in the profitable direction (it is never looser than the initial stop).
         """
-        Calculer un trailing stop dynamique
-        
-        Args:
-            entry_price: Prix d'entrée
-            current_price: Prix actuel
-            trailing_stop_pct: Pourcentage trailing (défaut 1%)
-        
-        Returns:
-            Prix du stop loss ajusté
-        """
-        if current_price <= entry_price:
-            # Pas de profit - stop loss classique
-            return entry_price * (1 - trailing_stop_pct / 100)
-        
-        # Profit existe - trailing stop
-        profit_pct = (current_price - entry_price) / entry_price
-        trailing_distance = current_price * (trailing_stop_pct / 100)
-        
-        # Ajuster stop loss avec profit
-        adjusted_stop = current_price - trailing_distance
-        
-        return adjusted_stop
+        frac = trailing_stop_pct / 100
+        if direction == "SELL":
+            return min(entry_price * (1 + frac), current_price * (1 + frac))
+        return max(entry_price * (1 - frac), current_price * (1 - frac))
 
     def calculate_volatility_adjustment(self, 
                                       prices: np.ndarray,
@@ -185,6 +205,7 @@ class PortfolioRiskManager:
         """Retourner les métriques de risque"""
         total_pnl = sum(self.daily_pnl)
         num_trades = len(self.daily_trades)
+        today_pnl = self.today_pnl
         
         # Calcul Sharpe Ratio (simplifié)
         if len(self.daily_pnl) > 1:
@@ -195,7 +216,7 @@ class PortfolioRiskManager:
         
         # Win rate
         winning_trades = sum(1 for p in self.daily_pnl if p > 0)
-        win_rate = winning_trades / (num_trades + 1e-8)
+        win_rate = winning_trades / num_trades if num_trades else 0.0
         
         # Profit factor
         total_gains = sum(p for p in self.daily_pnl if p > 0)
@@ -211,7 +232,8 @@ class PortfolioRiskManager:
             'sharpe_ratio': sharpe,
             'max_drawdown': self.max_drawdown * 100,
             'current_capital': self.current_capital,
-            'consecutive_losses': self.consecutive_losses
+            'consecutive_losses': self.consecutive_losses,
+            'today_pnl': today_pnl,
         }
 
 

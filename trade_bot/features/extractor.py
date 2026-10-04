@@ -1,9 +1,19 @@
 import numpy as np
-import pandas as pd
 from typing import Tuple, List
 
+def _squash(x: float, gain: float = 2.0) -> float:
+    """Map a price-relative move (in %) to (-1, 1). 0.5 % → tanh(1.0) ≈ 0.76."""
+    return float(np.tanh(gain * x))
+
+
 class FeatureExtractor:
-    """Extracteur de features pour le trading XAU/USD"""
+    """Extracteur de features pour le trading XAU/USD.
+
+    Every feature is scale-free and already lies in roughly [-1, 1] (price moves
+    are expressed in % of price then squashed with tanh; oscillators are centred),
+    so the state means the same thing at 1 800 $ and at 3 000 $ and no single
+    feature (e.g. RSI in 0-100) can drown the others.
+    """
     
     def __init__(self, lookback_window=20):
         self.lookback_window = lookback_window
@@ -18,7 +28,7 @@ class FeatureExtractor:
         if len(price_history) < self.lookback_window:
             return self._get_empty_features()
         
-        prices = np.array(price_history[-self.lookback_window:])
+        prices = np.array(price_history[-self.lookback_window:], dtype=np.float64)
         
         features = []
         
@@ -38,6 +48,8 @@ class FeatureExtractor:
         if volume_history is not None and len(volume_history) >= self.lookback_window:
             volume = np.array(volume_history[-self.lookback_window:])
             features.extend(self._get_volume_features(volume))
+        else:
+            features.extend([0.0, 0.0])  # keep the vector at STATE_SIZE (18) without volume
         
         # Normalize features
         features = np.array(features, dtype=np.float32)
@@ -50,22 +62,23 @@ class FeatureExtractor:
         features = []
         
         # Rate of change
-        roc = (prices[-1] - prices[0]) / (prices[0] + 1e-8)
-        features.append(roc)
-        
+        last = prices[-1] + 1e-8
+        roc = 100 * (prices[-1] - prices[0]) / (prices[0] + 1e-8)
+        features.append(_squash(roc))
+
         # Simple moving average (SMA)
         sma_short = np.mean(prices[-5:])
         sma_long = np.mean(prices)
-        features.append(prices[-1] - sma_short)
-        features.append(sma_short - sma_long)
-        
+        features.append(_squash(100 * (prices[-1] - sma_short) / last))
+        features.append(_squash(100 * (sma_short - sma_long) / last))
+
         # Exponential moving average (EMA)
         ema = self._calculate_ema(prices, 5)
-        features.append(prices[-1] - ema)
-        
-        # Momentum (price change over period)
-        momentum = prices[-1] - prices[-5] if len(prices) >= 5 else 0
-        features.append(momentum)
+        features.append(_squash(100 * (prices[-1] - ema) / last))
+
+        # Momentum (price change over 5 bars)
+        momentum = 100 * (prices[-1] - prices[-5]) / (prices[-5] + 1e-8) if len(prices) >= 5 else 0.0
+        features.append(_squash(momentum))
         
         return features
 
@@ -74,13 +87,14 @@ class FeatureExtractor:
         features = []
         
         # Standard deviation
-        volatility = np.std(prices)
-        features.append(volatility)
-        
+        mean_price = np.mean(prices) + 1e-8
+        volatility = 100 * np.std(prices) / mean_price
+        features.append(_squash(volatility))
+
         # ATR-like: Average True Range (simplified)
         returns = np.diff(prices)
-        atr = np.mean(np.abs(returns))
-        features.append(atr)
+        atr = 100 * np.mean(np.abs(returns)) / mean_price
+        features.append(_squash(atr, gain=10.0))
         
         # Bollinger Bands
         sma = np.mean(prices)
@@ -89,11 +103,11 @@ class FeatureExtractor:
         lower_band = sma - 2 * std
         
         bb_position = (prices[-1] - lower_band) / (upper_band - lower_band + 1e-8)
-        features.append(bb_position)
-        
+        features.append(float(np.clip(2 * bb_position - 1, -1.0, 1.0)))  # centred: -1 lower … +1 upper
+
         # Range
-        price_range = (np.max(prices) - np.min(prices)) / (np.mean(prices) + 1e-8)
-        features.append(price_range)
+        price_range = 100 * (np.max(prices) - np.min(prices)) / mean_price
+        features.append(_squash(price_range))
         
         return features
 
@@ -104,8 +118,8 @@ class FeatureExtractor:
         # Linear regression slope
         x = np.arange(len(prices))
         z = np.polyfit(x, prices, 1)
-        slope = z[0]
-        features.append(slope)
+        slope_pct = 100 * z[0] * len(prices) / (np.mean(prices) + 1e-8)  # % move over the window
+        features.append(_squash(slope_pct))
         
         # Higher highs / Lower lows
         recent_high = np.max(prices[-5:]) if len(prices) >= 5 else prices[-1]
@@ -121,7 +135,7 @@ class FeatureExtractor:
         # Trend strength (ADX-like)
         uptrend = np.sum(np.diff(prices) > 0)
         downtrend = np.sum(np.diff(prices) < 0)
-        trend_strength = (uptrend - downtrend) / len(prices)
+        trend_strength = (uptrend - downtrend) / max(len(prices) - 1, 1)
         features.append(trend_strength)
         
         return features
@@ -132,17 +146,17 @@ class FeatureExtractor:
         
         # RSI (Relative Strength Index)
         rsi = self._calculate_rsi(prices)
-        features.append(rsi)
-        
+        features.append((rsi - 50.0) / 50.0)
+
         # Distance to SMA
         sma = np.mean(prices)
         distance_to_mean = (prices[-1] - sma) / (sma + 1e-8)
-        features.append(distance_to_mean)
+        features.append(_squash(100 * distance_to_mean))
         
         # Stochastic oscillator
         stoch = self._calculate_stochastic(prices)
-        features.append(stoch)
-        
+        features.append((stoch - 50.0) / 50.0)
+
         return features
 
     def _get_volume_features(self, volume: np.ndarray) -> List[float]:
@@ -152,11 +166,11 @@ class FeatureExtractor:
         # Volume trend
         vol_sma = np.mean(volume)
         vol_trend = volume[-1] / (vol_sma + 1e-8)
-        features.append(vol_trend)
-        
-        # Volume volatility
-        vol_volatility = np.std(volume)
-        features.append(vol_volatility)
+        features.append(float(np.clip(vol_trend - 1.0, -1.0, 1.0)))
+
+        # Volume volatility (relative to mean volume)
+        vol_volatility = np.std(volume) / (vol_sma + 1e-8)
+        features.append(float(np.clip(vol_volatility, 0.0, 1.0)))
         
         return features
 
@@ -209,14 +223,9 @@ class FeatureExtractor:
         return stoch
 
     def _normalize_features(self, features: np.ndarray) -> np.ndarray:
-        """Normalize features to [-1, 1] range"""
-        # Clip extreme values
-        features = np.clip(features, -5, 5)
-        
-        # Normalize
-        normalized = features / (np.abs(features).max() + 1e-8)
-        
-        return normalized
+        """Safety net: features are bounded by construction; guard against NaN/inf."""
+        features = np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
+        return np.clip(features, -1.0, 1.0)
 
     def _get_empty_features(self) -> np.ndarray:
         """Return empty features when insufficient data"""

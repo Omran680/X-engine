@@ -5,7 +5,7 @@ import json
 import time
 from typing import Dict
 
-from trade_bot.core.config import GROQ_CALL_COOLDOWN, GROQ_MAX_RETRIES
+from trade_bot.core.config import GROQ_CALL_COOLDOWN, GROQ_MAX_RETRIES, GROQ_MODEL
 from trade_bot.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -21,7 +21,7 @@ class GrokTradeAgent:
             raise ValueError("GROQ_API_KEY not set in environment")
 
         self.client = Groq(api_key=self.api_key)
-        self.model  = "gemma2-9b-it"
+        self.model  = GROQ_MODEL
         self._last_call:   float = 0
         self._call_cooldown: float = GROQ_CALL_COOLDOWN
         self._max_retries:   int   = GROQ_MAX_RETRIES
@@ -39,8 +39,9 @@ class GrokTradeAgent:
         recent_change = ((price - prices[0]) / prices[0] * 100) if prices[0] != 0 else 0.0
         trend         = "UP" if price > sma_20 else "DOWN" if price < sma_20 else "FLAT"
         momentum      = "STRONG" if abs(recent_change) > 0.5 else "WEAK"
-        volume        = sum(volume_history[-5:]) / 5 if volume_history else 1000
-        volume_trend  = "HIGH" if volume > 1500 else "LOW"
+        volume        = sum(volume_history[-5:]) / len(volume_history[-5:]) if volume_history else 1000
+        avg_vol_all   = sum(volume_history) / len(volume_history) if volume_history else volume
+        volume_trend  = "HIGH" if volume > 1.2 * avg_vol_all else "LOW"
         price_range   = max(prices[-10:]) - min(prices[-10:]) if len(prices) >= 10 else 0.0
 
         prompt = f"""You are a professional gold (XAU/USD) trader. Analyze this market snapshot and decide: BUY, SELL, or HOLD.

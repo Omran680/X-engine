@@ -30,8 +30,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import sys
+import hmac
+import ipaddress
 import os
+import sys
 
 # Make project root importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -43,6 +45,7 @@ from mcp.types import Tool, TextContent
 from .context import BotContext
 from . import read_tools
 from . import exec_tools
+from trade_bot.core.config import MCP_DEFAULT_HOST
 from trade_bot.core.logging import get_logger
 
 logger = get_logger("mcp_server")
@@ -105,12 +108,51 @@ async def run_stdio(ctx: BotContext) -> None:
         await app.run(read_stream, write_stream, app.create_initialization_options())
 
 
-async def run_sse(ctx: BotContext, port: int = 8765) -> None:
-    """HTTP + SSE transport — useful for local dashboards / testing."""
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class _BearerAuth:
+    """Minimal ASGI middleware: require ``Authorization: Bearer <token>`` on every request."""
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self._expected = f"Bearer {token}".encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            supplied = dict(scope["headers"]).get(b"authorization", b"")
+            if not hmac.compare_digest(supplied, self._expected):
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"text/plain")]})
+                await send({"type": "http.response.body", "body": b"unauthorized"})
+                return
+        await self.app(scope, receive, send)
+
+
+async def run_sse(ctx: BotContext, port: int = 8765, host: str = MCP_DEFAULT_HOST) -> None:
+    """HTTP + SSE transport.
+
+    The server exposes order-sending tools, so it listens on loopback only unless a
+    bearer token is configured (MCP_AUTH_TOKEN) — binding a public interface without
+    authentication is refused.
+    """
     from mcp.server.sse import SseServerTransport
     from starlette.applications import Starlette
     from starlette.routing import Mount, Route
     import uvicorn
+
+    token = os.getenv("MCP_AUTH_TOKEN")
+    if not _is_loopback(host) and not token:
+        raise RuntimeError(
+            f"Refusing to expose trading tools on {host} without authentication — "
+            "set MCP_AUTH_TOKEN or bind 127.0.0.1"
+        )
 
     app = create_server(ctx)
     sse = SseServerTransport("/messages/")
@@ -125,9 +167,11 @@ async def run_sse(ctx: BotContext, port: int = 8765) -> None:
             Mount("/messages/", app=sse.handle_post_message),
         ]
     )
+    asgi = _BearerAuth(starlette_app, token) if token else starlette_app
 
-    logger.info("MCP server starting — SSE transport on http://0.0.0.0:%d/sse", port)
-    config = uvicorn.Config(starlette_app, host="0.0.0.0", port=port, log_level="warning")
+    logger.info("MCP server starting — SSE transport on http://%s:%d/sse (auth=%s)",
+                host, port, "bearer" if token else "none/loopback")
+    config = uvicorn.Config(asgi, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
     await server.serve()
 
@@ -140,12 +184,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Trade-bot MCP server")
     parser.add_argument("--http", action="store_true", help="Use SSE/HTTP transport instead of stdio")
     parser.add_argument("--port", type=int, default=8765, help="Port for SSE transport (default 8765)")
+    parser.add_argument("--host", default=MCP_DEFAULT_HOST,
+                        help="Bind address for SSE (default 127.0.0.1; non-loopback needs MCP_AUTH_TOKEN)")
     args = parser.parse_args()
 
     ctx = BotContext()
 
     if args.http:
-        asyncio.run(run_sse(ctx, port=args.port))
+        asyncio.run(run_sse(ctx, port=args.port, host=args.host))
     else:
         asyncio.run(run_stdio(ctx))
 

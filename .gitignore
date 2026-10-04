@@ -34,15 +34,16 @@ env/
 *~
 .DS_Store
 
-# Models and Data
-models/
+# Models and Data (anchored: /models = saved weights; trade_bot/models = source package)
+/models/
 *.h5
 *.pkl
+*.npz
 *.pth
 *.ckpt
-data/
+/data/
 *.csv
-logs/
+/logs/
 
 # TensorFlow
 .tf/

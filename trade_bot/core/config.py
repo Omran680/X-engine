@@ -1,3 +1,9 @@
+import os as _os
+
+# Project root (…/X-engine) — all runtime paths are absolute so the bot behaves
+# the same whatever the current working directory (launchd, MCP client, cron…).
+PROJECT_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
 # ============= TRADING CONFIG =============
 # Default asset: Gold (XAU/USD)
 EPIC = "CS.D.IN_GOLD.MFI.IP"
@@ -50,10 +56,37 @@ EVAL_INTERVAL = 10  # Evaluate every N episodes
 EVAL_EPISODES = 5
 
 # ============= LOGGING =============
-LOG_DIR = "./logs"
-MODELS_DIR = "./models"
-CHECKPOINT_INTERVAL = 50  # Save checkpoint every N episodes
+LOG_DIR = _os.path.join(PROJECT_ROOT, "logs")
+MODELS_DIR = _os.path.join(PROJECT_ROOT, "models")
+CHECKPOINT_STEPS = 500  # Save a checkpoint every N live steps
 LOG_LEVEL = "INFO"  # DEBUG | INFO | WARNING | ERROR
+
+# ============= LOOP / DATA =============
+LOOP_INTERVAL_SECONDS = 5      # Sleep between decision steps
+MIN_HISTORY_BARS = 20          # Price bars needed before the first decision
+TRANSACTION_COST = 0.00005     # Per-action cost (0.005 %, spread proxy) charged in the RL reward
+DEFAULT_VOLUME = 1000.0        # IG gives no tick volume → neutral constant (volume features are inert)
+
+# ============= MARKET HOURS / RESILIENCE =============
+MARKET_CLOSED_POLL_SECONDS = 60      # poll cadence while the market is closed (weekend, daily break)
+MARKET_CLOSED_LONG_POLL_SECONDS = 300  # …after being closed for more than 1 h
+DATA_GAP_RESET_SECONDS = 300         # no price for this long ⇒ drop history (a gap would poison the features)
+OUTAGE_MAX_BACKOFF_SECONDS = 120     # cap of the exponential backoff on network/API outages
+HEARTBEAT_FILE = _os.path.join(PROJECT_ROOT, "logs", "heartbeat.json")
+
+# ============= RISK / SAFETY =============
+RISK_INITIAL_CAPITAL = 10_000.0
+MAX_DAILY_LOSS_PCT = 0.05      # Stop opening trades after -5 % of capital in a day
+MAX_CONSECUTIVE_LOSSES = 3     # Pause after N losses in a row (resets next day)
+MAX_ORDER_SIZE = 1.0           # Hard cap on lots for any order (incl. MCP open_trade)
+MAX_OPEN_POSITIONS = 2         # Main + scalp
+POINT_VALUE = 1.0              # PnL per point per lot (estimate for risk accounting)
+
+# ============= IG ACCOUNT =============
+IG_ACC_TYPE = _os.getenv("IG_ACC_TYPE", "DEMO").upper()   # DEMO | LIVE
+
+# ============= MCP SERVER =============
+MCP_DEFAULT_HOST = "127.0.0.1"  # Never expose order-sending tools on 0.0.0.0 by default
 
 # ============= API RATE LIMITING =============
 API_RATE_LIMIT_INTERVAL = 2    # Min seconds between IG Markets API calls
@@ -64,6 +97,7 @@ API_BACKOFF_BASE = 2           # Base backoff for generic API errors (seconds)
 # ============= GROQ LLM =============
 GROQ_CALL_COOLDOWN = 2         # Min seconds between Groq calls
 GROQ_MAX_RETRIES = 3           # Max retries on Groq API error
+GROQ_MODEL = _os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")  # gemma2-9b-it was decommissioned
 
 # ============= SCALPING =============
 SCALP_ENABLED = False          # Off by default — enable via MCP or --scalping flag

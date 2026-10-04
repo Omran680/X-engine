@@ -1,0 +1,10 @@
+# /etc/systemd/system/x-engine-health.timer
+[Unit]
+Description=Run the X-engine watchdog every 2 minutes
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

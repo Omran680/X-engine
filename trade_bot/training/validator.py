@@ -17,7 +17,7 @@ def validate_environment_optimizer():
     print_header("VALIDATION 1: Environment Optimizer")
     
     try:
-        from environment_optimizer import EnrichedFeatureExtractor, RiskAdjustedRewardCalculator
+        from trade_bot.features.optimizer import EnrichedFeatureExtractor, RiskAdjustedRewardCalculator
         
         # Test feature extraction
         extractor = EnrichedFeatureExtractor(lookback=60)
@@ -70,7 +70,7 @@ def validate_training_curriculum():
     print_header("VALIDATION 2: Training Curriculum")
     
     try:
-        from training_curriculum import (
+        from trade_bot.training.curriculum import (
             MarketRegimeDetector, DifficultyScheduler, TrainingProgression
         )
         
@@ -135,7 +135,7 @@ def validate_meta_evaluator():
     print_header("VALIDATION 3: Meta Evaluator")
     
     try:
-        from meta_evaluator import MetaEvaluator
+        from trade_bot.training.evaluator import MetaEvaluator
         
         evaluator = MetaEvaluator(window_size=50)
         
@@ -192,7 +192,7 @@ def validate_advanced_agent():
     print_header("VALIDATION 4: Advanced Agent (Fixed)")
     
     try:
-        from advanced_agent import (
+        from trade_bot.agents.advanced import (
             DuelingDQNAgent, RiskAwarePPOAgent, AdvancedHybridTradingAgent
         )
         
@@ -261,8 +261,8 @@ def validate_optimized_trainer():
     print_header("VALIDATION 5: Optimized Trainer")
     
     try:
-        from optimized_trainer import OptimizedTrainer, TrainingStrategy
-        from advanced_agent import AdvancedHybridTradingAgent
+        from trade_bot.training.trainer import OptimizedTrainer, TrainingStrategy
+        from trade_bot.agents.advanced import AdvancedHybridTradingAgent
         
         agent = AdvancedHybridTradingAgent(state_size=48)
         

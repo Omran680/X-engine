@@ -10,13 +10,18 @@ Integrates all optimization components:
 """
 
 import numpy as np
-from environment_optimizer import EnrichedFeatureExtractor, RiskAdjustedRewardCalculator
-from training_curriculum import (
+from typing import Dict, List, Tuple
+
+from trade_bot.features.optimizer import EnrichedFeatureExtractor, RiskAdjustedRewardCalculator
+from trade_bot.training.curriculum import (
     MarketRegimeDetector, DifficultyScheduler, RegimeAwareTrainer, TrainingProgression
 )
-from meta_evaluator import MetaEvaluator, TransferLearner, PaperTradingEngine
-from advanced_agent import AdvancedHybridTradingAgent
-from typing import Dict, List, Tuple
+from trade_bot.training.evaluator import MetaEvaluator, TransferLearner, PaperTradingEngine
+
+try:
+    from trade_bot.agents.advanced import AdvancedHybridTradingAgent
+except ImportError:      # never implemented in this repo — see README "Known limitations"
+    AdvancedHybridTradingAgent = None
 
 
 class OptimizedTrainer:

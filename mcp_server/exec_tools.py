@@ -11,17 +11,47 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from typing import Any
 
 from mcp.types import Tool, TextContent
 
 from .context import BotContext
+from trade_bot.core.config import EPIC, MAX_ORDER_SIZE
 from trade_bot.core.logging import get_logger
 
 logger = get_logger(__name__)
 
 _VALID_DIRECTIONS = {"BUY", "SELL"}
+
+# (min, max) accepted for each runtime-tunable scalping parameter
+_SCALP_BOUNDS: dict[str, tuple[float, float]] = {
+    "sl_pct":            (0.01, 5.0),
+    "tp_pct":            (0.01, 10.0),
+    "size":              (0.01, MAX_ORDER_SIZE),
+    "lookback":          (5, 200),
+    "max_trades_hour":   (1, 60),
+    "max_hold_seconds":  (10, 3600),
+    "bb_squeeze_factor": (0.0001, 0.05),
+    "momentum_thresh":   (0.00001, 0.01),
+    "rsi_low":           (5, 50),
+    "rsi_high":          (50, 95),
+    "volume_spike_mult": (1.0, 10.0),
+}
+_SCALP_INT_KEYS = {"lookback", "max_trades_hour", "max_hold_seconds"}
+
+
+def _validate_scalp_params(arguments: dict[str, Any]) -> dict[str, float | int]:
+    """Cast and range-check scalping params; unknown keys and bad values raise ValueError."""
+    clean: dict[str, float | int] = {}
+    for key, raw in arguments.items():
+        if key not in _SCALP_BOUNDS:
+            raise ValueError(f"unknown scalp parameter {key!r}")
+        value = int(raw) if key in _SCALP_INT_KEYS else float(raw)
+        lo, hi = _SCALP_BOUNDS[key]
+        if not lo <= value <= hi:
+            raise ValueError(f"{key}={value} out of range [{lo}, {hi}]")
+        clean[key] = value
+    return clean
 
 
 # ---------------------------------------------------------------------------
@@ -150,9 +180,9 @@ async def handle(name: str, arguments: dict[str, Any], ctx: BotContext) -> list[
         if direction not in _VALID_DIRECTIONS:
             raise ValueError(f"direction must be BUY or SELL, got {direction!r}")
         size = float(arguments.get("size", 0))
-        if size <= 0:
-            raise ValueError(f"size must be positive, got {size}")
-        epic = arguments.get("epic") or os.getenv("EPIC", "CS.D.IN_GOLD.MFI.IP")
+        if not 0 < size <= MAX_ORDER_SIZE:
+            raise ValueError(f"size must be in (0, {MAX_ORDER_SIZE}] lots, got {size}")
+        epic = arguments.get("epic") or os.getenv("EPIC", EPIC)
         sl   = arguments.get("stop_distance")
         tp   = arguments.get("limit_distance")
         logger.info("EXEC open_trade: %s %s size=%.3f sl=%s tp=%s", direction, epic, size, sl, tp)
@@ -185,15 +215,10 @@ async def handle(name: str, arguments: dict[str, Any], ctx: BotContext) -> list[
 
     elif name == "save_models":
         try:
-            models_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "models")
-            sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-            from trade_bot.agents import HybridTradingAgent
-            from trade_bot.core.config import STATE_SIZE, ACTION_SIZE
-            agent = HybridTradingAgent(state_size=STATE_SIZE, action_size=ACTION_SIZE)
-            agent.load_models(models_dir)
-            agent.save_models(models_dir)
-            logger.info("EXEC save_models: saved to %s", models_dir)
-            payload = {"status": "saved", "path": models_dir}
+            # Persist the LIVE agent's weights (reloading from disk and re-saving was a no-op)
+            ctx.save_models()
+            logger.info("EXEC save_models: live weights persisted")
+            payload = {"status": "saved"}
         except Exception as e:
             logger.error("save_models failed: %s", e)
             payload = {"status": "error", "error": str(e)}
@@ -213,11 +238,7 @@ async def handle(name: str, arguments: dict[str, Any], ctx: BotContext) -> list[
         }
 
     elif name == "set_scalp_params":
-        # Cast numeric args to float/int as required
-        clean: dict = {}
-        int_keys = {"lookback", "max_trades_hour", "max_hold_seconds"}
-        for k, v in arguments.items():
-            clean[k] = int(v) if k in int_keys else float(v)
+        clean = _validate_scalp_params(arguments)
         if not clean:
             payload = {"status": "noop", "message": "no parameters provided"}
         else:

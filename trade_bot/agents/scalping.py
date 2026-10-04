@@ -24,6 +24,8 @@ Usage
 
 from __future__ import annotations
 
+import functools
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -86,6 +88,7 @@ class ScalpPosition:
     sl_price:     float
     tp_price:     float
     deal_id:      Optional[str] = None
+    max_hold_seconds: float = SCALP_MAX_HOLD_SECONDS
 
     def pnl_pct(self, current_price: float) -> float:
         if self.direction == "BUY":
@@ -103,12 +106,21 @@ class ScalpPosition:
         return price <= self.tp_price
 
     def timed_out(self) -> bool:
-        return (time.time() - self.entry_time) >= SCALP_MAX_HOLD_SECONDS
+        return (time.time() - self.entry_time) >= self.max_hold_seconds
 
 
 # ---------------------------------------------------------------------------
 # ScalpingAgent
 # ---------------------------------------------------------------------------
+
+def _locked(method):
+    """Serialise access: the trading loop and MCP tools call the agent from different threads."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
 
 class ScalpingAgent:
     """Stateful scalping agent — call evaluate() then tick() every loop."""
@@ -128,6 +140,8 @@ class ScalpingAgent:
         self.volume_spike_mult: float = SCALP_VOLUME_SPIKE
 
         # State
+        self._lock = threading.RLock()
+        self.last_closed:        Optional[dict]         = None   # details of the last auto-exit
         self.enabled:            bool                   = False
         self._position:          Optional[ScalpPosition] = None
         self._trade_timestamps:  deque                  = deque()  # rolling 1-hour window
@@ -142,6 +156,7 @@ class ScalpingAgent:
     # Public API
     # ------------------------------------------------------------------
 
+    @_locked
     def evaluate(self, prices: list[float], volumes: list[float] | None = None) -> ScalpSignal:
         """Compute the current scalping signal from recent price/volume data."""
         if not self.enabled:
@@ -170,8 +185,22 @@ class ScalpingAgent:
         self._last_signal = signal
         return signal
 
+    @_locked
+    def preview(self, prices: list[float], volumes: list[float] | None = None) -> ScalpSignal:
+        """Compute a signal WITHOUT touching agent state (no enabled/position/rate-limit gating)."""
+        if len(prices) < self.lookback:
+            return ScalpSignal(reason=f"insufficient data ({len(prices)}/{self.lookback})")
+        p = np.array(prices[-self.lookback:], dtype=np.float64)
+        v = (np.array(volumes[-self.lookback:], dtype=np.float64)
+             if volumes and len(volumes) >= self.lookback else np.ones(self.lookback))
+        return self._compute_signal(p, v)
+
+    @_locked
     def tick(self, current_price: float) -> Optional[str]:
-        """Check open position for SL / TP / timeout. Returns exit reason or None."""
+        """Check open position for SL / TP / timeout. Returns exit reason or None.
+
+        On exit the closed trade is available in ``last_closed``.
+        """
         if self._position is None:
             return None
 
@@ -187,6 +216,17 @@ class ScalpingAgent:
         if reason:
             pnl = self._position.pnl_pct(current_price)
             self._record_close(pnl)
+            # Remember what was closed: the caller needs the deal_id to close it on
+            # the exchange, and _position is cleared just below.
+            self.last_closed = {
+                "reason":      reason,
+                "direction":   self._position.direction,
+                "entry_price": self._position.entry_price,
+                "exit_price":  current_price,
+                "size":        self._position.size,
+                "pnl_pct":     pnl,
+                "deal_id":     self._position.deal_id,
+            }
             logger.info(
                 "Scalp EXIT [%s] @ %.2f | pnl=%.4f%% | reason=%s",
                 self._position.direction, current_price, pnl * 100, reason,
@@ -195,6 +235,7 @@ class ScalpingAgent:
 
         return reason
 
+    @_locked
     def open_position(self, direction: str, entry_price: float,
                       deal_id: str | None = None) -> ScalpPosition:
         """Record that a scalp position was opened."""
@@ -211,6 +252,7 @@ class ScalpingAgent:
             sl_price=sl,
             tp_price=tp,
             deal_id=deal_id,
+            max_hold_seconds=self.max_hold_seconds,
         )
         self._trade_timestamps.append(time.time())
         self.total_trades += 1
@@ -221,6 +263,7 @@ class ScalpingAgent:
         )
         return self._position
 
+    @_locked
     def force_exit(self, current_price: float) -> Optional[dict]:
         """Force-close the current scalp position (MCP emergency)."""
         if self._position is None:
@@ -231,6 +274,7 @@ class ScalpingAgent:
             "entry_price": self._position.entry_price,
             "exit_price":  current_price,
             "pnl_pct":     round(pnl * 100, 4),
+            "size":        self._position.size,
             "deal_id":     self._position.deal_id,
         }
         self._record_close(pnl)
@@ -238,9 +282,11 @@ class ScalpingAgent:
         self._position = None
         return result
 
+    @_locked
     def has_position(self) -> bool:
         return self._position is not None
 
+    @_locked
     def get_position_info(self) -> Optional[dict]:
         if self._position is None:
             return None
@@ -253,6 +299,7 @@ class ScalpingAgent:
             "open_seconds": round(time.time() - self._position.entry_time, 1),
         }
 
+    @_locked
     def get_status(self) -> dict:
         win_rate = (self.winning_trades / self.total_trades * 100
                     if self.total_trades > 0 else 0.0)
@@ -276,6 +323,7 @@ class ScalpingAgent:
             },
         }
 
+    @_locked
     def set_params(self, **kwargs) -> None:
         """Update scalping parameters at runtime."""
         allowed = {

@@ -119,6 +119,7 @@ python3 launch.py [OPTIONS]
   --scalping         Active l'agent scalping au démarrage
   --http             MCP en HTTP/SSE  (défaut : stdio pour Claude Desktop)
   --port 8765        Port SSE (défaut 8765)
+  --host 127.0.0.1   Adresse SSE (défaut loopback ; autre adresse ⇒ MCP_AUTH_TOKEN obligatoire)
 ```
 
 ### Exemples
@@ -130,15 +131,27 @@ python3 launch.py --dry-run --forever --http
 # Production : scalping + Groq activés
 python3 launch.py --forever --scalping --grok --http
 
-# Passer de DEMO à LIVE
-# → modifier acc_type="LIVE" dans trade_bot/execution/trader.py
+# Passer de DEMO à LIVE (argent réel) — double opt-in explicite
+# → IG_ACC_TYPE=LIVE et IG_ALLOW_LIVE=1 dans .env (sinon le bot refuse de démarrer)
 ```
 
 ### Arrêter proprement
 
 ```bash
-kill $(cat bot.pid)   # sauvegarde les modèles avant de quitter
+kill $(cat bot.pid)   # SIGTERM : sauvegarde les modèles avant de quitter
 ```
+
+Codes de sortie de `launch.py` : `0` arrêt propre (Ctrl-C, `emergency_stop`) · `78` erreur de
+configuration (identifiants manquants…) · `1` crash. `run_forever.sh` ne relance **que** sur crash,
+avec un backoff exponentiel (15 s → 10 min) pour ne pas marteler l'endpoint de login IG.
+
+### Sécurité
+
+- Le serveur MCP expose des outils qui envoient de vrais ordres : il écoute sur **127.0.0.1** par défaut.
+  Pour un autre bind, définir `MCP_AUTH_TOKEN` (jeton `Authorization: Bearer …` exigé) — sinon refus de démarrer.
+- Tous les ordres (boucle, scalping, MCP) passent par `PortfolioRiskManager` : perte journalière max 5 %,
+  3 pertes consécutives ⇒ pause jusqu'au lendemain, taille d'ordre plafonnée (`MAX_ORDER_SIZE`).
+- Poids des modèles en `.npz` (pas de `pickle` ⇒ pas d'exécution de code au chargement).
 
 ---
 
@@ -207,8 +220,8 @@ Ou lancer avec `--http` et pointer sur `http://localhost:8765/sse`.
      ↓                    ↓
  DQN Agent           PPO Agent
 (off-policy)        (on-policy)
-Double DQN          Actor-Critic + GAE
-Target network      Clipped surrogate
+DQN + target net     Actor-Critic + GAE
+Perte de Huber      Clipped surrogate + entropie
 
      ↓                    ↓
   Ensemble — weighted voting (poids adaptatifs)
@@ -243,10 +256,12 @@ Signal **HOLD** : dès qu'une condition échoue.
 logs/
 └── trade_bot.log     Rotation auto (10 MB × 5 fichiers)
 
-models/
-├── dqn_model.pkl     Poids DQN sauvegardés
-└── ppo_model.pkl     Poids PPO sauvegardés
+models/               (non versionné — le package source est trade_bot/models/)
+├── dqn_model.npz     Poids DQN sauvegardés
+└── ppo_model.npz     Poids PPO sauvegardés
 ```
+
+Un fichier de poids incompatible (autre `STATE_SIZE`) est ignoré avec un message d'erreur : le bot repart de zéro.
 
 Checkpoint automatique toutes les **500 steps** + sauvegarde sur `Ctrl+C` ou MCP `save_models`.
 
@@ -265,3 +280,57 @@ Checkpoint automatique toutes les **500 steps** + sauvegarde sur `Ctrl+C` ou MCP
 | `mcp` | ≥1.27 | Serveur MCP (Anthropic) |
 | `groq` | ≥0.4 | Client API Groq (LLM) |
 | `matplotlib` | ≥3.4, <4 | Visualisation *(optionnel)* |
+
+---
+
+## Déploiement production 24/7
+
+**Marché fermé (week-end, pause quotidienne, halt) :** le bot ne plante pas. Le statut IG
+(`marketStatus != TRADEABLE`) est détecté → aucun ordre, aucun apprentissage, sondage toutes les 60 s
+(300 s après 1 h), checkpoint des modèles à la fermeture. À la réouverture il reprend seul : l'historique
+de prix est purgé (le gap fausserait les indicateurs) puis 20 barres de ré-échauffement avant de retrader.
+Les pannes réseau/API suivent un backoff exponentiel (5 s → 120 s) au lieu de marteler IG.
+Les SL/TP posés chez IG protègent les positions ouvertes pendant toute interruption.
+
+**Superviseur (systemd, recommandé sur un VPS) :** voir `deploy/`.
+
+```bash
+sudo useradd -r -m xengine && sudo mkdir -p /opt/x-engine && sudo chown xengine /opt/x-engine
+# copier le projet dans /opt/x-engine, puis :
+cd /opt/x-engine && python3.10 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp .env.example .env && chmod 600 .env          # renseigner IG_* (DEMO d'abord)
+sudo cp deploy/x-engine*.service deploy/x-engine-health.timer /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now x-engine x-engine-health.timer
+journalctl -u x-engine -f                        # ou tail -f logs/trade_bot.log
+.venv/bin/python healthcheck.py                  # OK: age=…s market=CLOSED …
+```
+
+Le service ne redémarre qu'après un crash (backoff 5 s → 10 min), jamais après un arrêt propre
+(`emergency_stop`) ni une erreur de configuration (78). Le timer `x-engine-health` redémarre le bot si le
+heartbeat (`logs/heartbeat.json`) est périmé (process figé). Alternative : `Dockerfile` (volumes `models/`, `logs/`).
+
+**Check-list avant de passer en LIVE :** ≥ 1–2 semaines en DEMO sans crash (week-ends inclus) ·
+`IG_ACC_TYPE=LIVE` + `IG_ALLOW_LIVE=1` · `SIZE`/`SCALP_SIZE`/`MAX_ORDER_SIZE` réduits au minimum · SL/TP vérifiés
+dans l'interface IG · alerte sur `healthcheck.py` · sauvegarde périodique de `models/`.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests -q
+```
+
+68 tests couvrant : poids/IO, agents RL, ensemble, features, scalping, risque, client IG (faux `IGService`),
+boucle de trading complète (dry-run, panne API, sorties scalp, risque) et sécurité du serveur MCP.
+
+## Limitations connues
+
+- **Apprentissage en ligne à horizon 5 s** : le signal est très faible face au bruit/spread ; la récompense
+  (`step_reward`) est un proxy. Valider en DEMO / dry-run sur la durée avant toute confiance.
+- **Volume** : IG ne fournit pas de volume tick → constant (`DEFAULT_VOLUME`) ; les features volume et le filtre
+  « volume spike » du scalping sont donc inertes.
+- **PnL du risk manager** : estimé (`ΔP × taille × POINT_VALUE`) pour les positions fermées côté broker.
+- **Streaming IG** : non supporté par `trading_ig` (pas de `StreamingClient`) ; prix par polling REST + cache.
+- **`trade_bot/training/`** : imports réparés mais `AdvancedHybridTradingAgent` n'existe pas dans le dépôt —
+  ce module d'entraînement hors-ligne reste non fonctionnel tant qu'il n'est pas implémenté.
+- **`mcp` borné `<2.0`** : la 2.x a supprimé les décorateurs `@server.list_tools()` / `@server.call_tool()`.

@@ -45,6 +45,8 @@ class EnsembleDecisionMaker:
         elif self.strategy == EnsembleStrategy.MAJORITY_VOTING:
             return self._majority_voting_strict(dqn_output, ppo_output)
 
+        raise ValueError(f"Unsupported ensemble strategy: {self.strategy!r}")
+
     def _majority_voting(self, dqn_output, ppo_output):
         """Simple majority voting"""
         dqn_action = dqn_output['action']
@@ -91,7 +93,7 @@ class EnsembleDecisionMaker:
         action_votes[dqn_action] += dqn_score
         action_votes[ppo_action] += ppo_score
         
-        final_action = np.argmax(action_votes)
+        final_action = int(np.argmax(action_votes))
         final_confidence = np.max(action_votes) / (dqn_score + ppo_score + 1e-8)
         
         return {
@@ -115,7 +117,7 @@ class EnsembleDecisionMaker:
         
         # Weighted average
         combined_scores = (dqn_normalized * self.dqn_weight) + (ppo_probs * self.ppo_weight)
-        final_action = np.argmax(combined_scores)
+        final_action = int(np.argmax(combined_scores))
         confidence = combined_scores[final_action]
         
         return {
@@ -182,23 +184,27 @@ class EnsembleDecisionMaker:
             }
 
     def _meta_learner(self, features):
-        """Simple meta-learner (can be enhanced)"""
-        # Weighted sum of features
-        weights = np.array([0.3, 0.2, 0.15, 0.15, 0.1, 0.1])
-        score = np.sum(features[:6] * weights)
-        
-        if score > 0.6:
-            return int(features[0])  # Favor DQN decision
-        elif score > 0.3:
-            return int(features[3])  # Favor PPO decision
-        else:
-            return 2  # HOLD
+        """Simple meta-learner: confidence-weighted choice between the two voters.
+
+        ``features`` = [dqn_onehot(3), ppo_onehot(3), dqn_conf, ppo_conf, dqn_value, ppo_value].
+        """
+        dqn_action = int(np.argmax(features[0:3]))
+        ppo_action = int(np.argmax(features[3:6]))
+        if dqn_action == ppo_action:
+            return dqn_action
+        dqn_conf, ppo_conf = float(features[6]), float(features[7])
+        if max(dqn_conf, ppo_conf) < 0.4:
+            return 2  # nobody is convinced → HOLD
+        return dqn_action if dqn_conf >= ppo_conf else ppo_action
 
     def update_weights(self, dqn_reward, ppo_reward):
         """Ajuster les poids en fonction des rewards"""
-        total_reward = dqn_reward + ppo_reward + 1e-8
-        self.dqn_weight = dqn_reward / total_reward
-        self.ppo_weight = ppo_reward / total_reward
+        # Softmax over rewards: stays in [0, 1] and sums to 1 even when rewards
+        # are negative (a plain ratio went negative / exploded near zero).
+        r = np.array([dqn_reward, ppo_reward], dtype=np.float64)
+        w = np.exp(r - r.max())
+        w /= w.sum()
+        self.dqn_weight, self.ppo_weight = float(w[0]), float(w[1])
         
         self.history.append({
             'dqn_weight': self.dqn_weight,

@@ -35,8 +35,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import sys
 import os
+import signal
+import sys
 import threading
 
 # Ensure project root is on the path
@@ -45,7 +46,11 @@ sys.path.insert(0, os.path.dirname(__file__))
 from mcp_server.context import BotContext
 from mcp_server.server import run_stdio, run_sse
 from main import XAUUSDHybridTrader
+from trade_bot.core.config import MCP_DEFAULT_HOST
 from trade_bot.core.logging import get_logger
+from trade_bot.execution.trader import ConfigError
+
+EXIT_CONFIG = 78   # EX_CONFIG — supervisor must NOT restart (a retry cannot fix it)
 
 logger = get_logger("launch")
 
@@ -54,7 +59,8 @@ logger = get_logger("launch")
 # MCP background thread
 # ---------------------------------------------------------------------------
 
-def _start_mcp_thread(ctx: BotContext, use_http: bool, port: int) -> threading.Thread:
+def _start_mcp_thread(ctx: BotContext, use_http: bool, port: int,
+                      host: str = MCP_DEFAULT_HOST) -> threading.Thread:
     """Start the MCP server in a daemon thread with its own asyncio event loop."""
 
     def _run():
@@ -62,7 +68,7 @@ def _start_mcp_thread(ctx: BotContext, use_http: bool, port: int) -> threading.T
         asyncio.set_event_loop(loop)
         try:
             if use_http:
-                loop.run_until_complete(run_sse(ctx, port=port))
+                loop.run_until_complete(run_sse(ctx, port=port, host=host))
             else:
                 loop.run_until_complete(run_stdio(ctx))
         except Exception as e:
@@ -74,7 +80,7 @@ def _start_mcp_thread(ctx: BotContext, use_http: bool, port: int) -> threading.T
     thread.start()
     logger.info(
         "MCP server started in background thread (transport=%s%s)",
-        "http:" + str(port) if use_http else "stdio",
+        f"http://{host}:{port}" if use_http else "stdio",
         "",
     )
     return thread
@@ -95,47 +101,55 @@ def main() -> None:
     parser.add_argument("--scalping",  action="store_true", help="Enable scalping agent at startup")
     parser.add_argument("--http",      action="store_true", help="Use HTTP/SSE transport instead of stdio")
     parser.add_argument("--port",      type=int, default=8765, help="SSE port (default 8765)")
+    parser.add_argument("--host",      default=MCP_DEFAULT_HOST,
+                        help="SSE bind address (default 127.0.0.1; anything else requires MCP_AUTH_TOKEN)")
     args = parser.parse_args()
+
+    # SIGTERM (kill, launchd, docker stop) → same graceful path as Ctrl-C: models get saved
+    def _on_sigterm(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
     # ── 1. Shared context ──────────────────────────────────────────────
     logger.info("Initialising shared BotContext...")
     ctx = BotContext()
 
     # ── 2. MCP server (background) ────────────────────────────────────
-    _start_mcp_thread(ctx, use_http=args.http, port=args.port)
+    _start_mcp_thread(ctx, use_http=args.http, port=args.port, host=args.host)
 
     # ── 3. Trading bot (foreground, reuses Trader from ctx) ───────────
-    bot = XAUUSDHybridTrader(
-        use_live_data=True,
-        dry_run=args.dry_run,
-        use_grok=args.grok,
-        ctx=ctx,                 # ← inject shared context
-    )
+    try:
+        bot = XAUUSDHybridTrader(
+            use_live_data=True,
+            dry_run=args.dry_run,
+            use_grok=args.grok,
+            ctx=ctx,                 # ← inject shared context
+        )
+    except ConfigError as e:
+        logger.error("Configuration error: %s", e)
+        sys.exit(EXIT_CONFIG)
 
     if args.scalping:
         ctx.scalping.enabled = True
         logger.info("Scalping agent ENABLED via --scalping flag")
-
-    if bot.trader:
-        try:
-            bot.trader.enable_streaming(bot.epic)
-        except Exception as e:
-            logger.warning("Streaming not enabled: %s", e)
 
     logger.info("Loading models...")
     bot.load_models()
 
     max_steps = None if args.forever else args.max_steps
 
+    exit_code = 0
     try:
         bot.live_trading_loop(max_steps=max_steps)
-        bot.save_models()
     except KeyboardInterrupt:
-        bot.save_models()
-        logger.info("Stopped safely (KeyboardInterrupt)")
+        logger.info("Stopped safely (signal)")
     except Exception as e:
         logger.exception("Unhandled error in trading loop: %s", e)
+        exit_code = 1                # non-zero → supervisor restarts with backoff
+    finally:
         bot.save_models()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

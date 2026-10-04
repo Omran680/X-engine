@@ -4,6 +4,7 @@ import numpy as np
 import os
 from trade_bot.models.networks import DQNNetwork, PPONetwork, softmax
 from trade_bot.models.replay_buffer import ReplayBuffer
+from trade_bot.core.config import MODELS_DIR, PPO_CLIP_RATIO, PPO_ENTROPY_COEFF, PPO_EPOCHS
 from trade_bot.core.logging import get_logger
 from collections import deque
 
@@ -54,14 +55,13 @@ class DQNAgent:
         next_q_values = self.target_model.forward(next_states)
         max_next_q    = np.max(next_q_values, axis=1)
 
-        target_q = q_values.copy()
-        for i in range(batch_size):
-            if dones[i]:
-                target_q[i, actions[i]] = rewards[i]
-            else:
-                target_q[i, actions[i]] = rewards[i] + self.gamma * max_next_q[i]
-
-        error = (q_values - target_q) / batch_size
+        idx = np.arange(batch_size)
+        targets = rewards + self.gamma * max_next_q * (1.0 - dones)
+        # Only the taken action carries error; Huber gradient (clip to ±1) keeps
+        # a single outlier reward from blowing up the weights.
+        error = np.zeros_like(q_values)
+        error[idx, actions] = np.clip(q_values[idx, actions] - targets, -1.0, 1.0)
+        error /= batch_size
 
         dW3 = self.model.last_h2.T.dot(error);  db3 = np.sum(error, axis=0)
         dh2 = error.dot(self.model.w3.T);        dh2[self.model.last_h2 <= 0] = 0.0
@@ -81,7 +81,6 @@ class DQNAgent:
             self.epsilon *= self.epsilon_decay
 
     def save(self, filepath):
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         self.model.save(filepath)
 
     def load(self, filepath):
@@ -143,46 +142,56 @@ class PPOAgent:
         return float(value.reshape(-1)[0])
 
     def train(self, advantages, returns, states):
-        actions     = np.array(self.action_buffer,  dtype=np.int32)
+        """PPO update: clipped surrogate objective, value loss and entropy bonus."""
+        actions      = np.array(self.action_buffer,  dtype=np.int32)
         old_logprobs = np.array(self.logprob_buffer, dtype=np.float32)
-        advantages  = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        B = states.shape[0]
+        advantages   = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        B   = states.shape[0]
+        idx = np.arange(B)
+        eps = PPO_CLIP_RATIO
 
-        for _ in range(3):
+        for _ in range(PPO_EPOCHS):
             logits, values = self.model.predict(states)
-            probs = softmax(logits)
-            idx   = np.arange(B)
+            probs    = softmax(logits)
             logprobs = np.log(probs[idx, actions] + 1e-8)
-            ratios = np.exp(logprobs - old_logprobs)
+            ratios   = np.exp(np.clip(logprobs - old_logprobs, -20.0, 20.0))
+
+            # Gradient of -min(r·A, clip(r, 1±eps)·A) flows only while unclipped
+            active = np.where(advantages >= 0, ratios <= 1.0 + eps, ratios >= 1.0 - eps)
 
             dlogits = probs.copy()
             dlogits[idx, actions] -= 1.0
-            dlogits *= (advantages[:, None] / B)
+            dlogits *= (advantages * ratios * active)[:, None] / B
 
-            dvalues  = 2.0 * (values.reshape(-1) - returns)[:, None] / B
+            # Entropy bonus: ∂(-c·H)/∂z = c · p · (log p + H)
+            logp_all = np.log(probs + 1e-8)
+            entropy  = -np.sum(probs * logp_all, axis=1, keepdims=True)
+            dlogits += PPO_ENTROPY_COEFF * probs * (logp_all + entropy) / B
 
-            dactor_w = self.model.last_h1.T.dot(dlogits)
-            dactor_b = np.sum(dlogits, axis=0)
-            dcritic_w = self.model.last_h1.T.dot(dvalues)
-            dcritic_b = np.sum(dvalues, axis=0)
+            dvalues = 2.0 * (values.reshape(-1) - returns)[:, None] / B
 
+            grads = {
+                "actor_w":  self.model.last_h1.T.dot(dlogits),
+                "actor_b":  np.sum(dlogits, axis=0),
+                "critic_w": self.model.last_h1.T.dot(dvalues),
+                "critic_b": np.sum(dvalues, axis=0),
+            }
             dh = dlogits.dot(self.model.actor_w.T) + dvalues.dot(self.model.critic_w.T)
             dh[self.model.last_h1 <= 0] = 0.0
-            dw1 = states.T.dot(dh);  db1 = np.sum(dh, axis=0)
+            grads["w1"] = states.T.dot(dh)
+            grads["b1"] = np.sum(dh, axis=0)
 
-            self.model.actor_w  -= self.lr * dactor_w
-            self.model.actor_b  -= self.lr * dactor_b
-            self.model.critic_w -= self.lr * dcritic_w
-            self.model.critic_b -= self.lr * dcritic_b
-            self.model.w1 -= self.lr * dw1
-            self.model.b1 -= self.lr * db1
+            # Global gradient-norm clipping
+            norm = float(np.sqrt(sum(float(np.sum(g * g)) for g in grads.values())))
+            scale = min(1.0, 0.5 / (norm + 1e-8))
+            for name, g in grads.items():
+                setattr(self.model, name, getattr(self.model, name) - self.lr * scale * g)
 
         for buf in (self.state_buffer, self.action_buffer, self.reward_buffer,
                     self.value_buffer, self.logprob_buffer):
             buf.clear()
 
     def save(self, filepath):
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         self.model.save(filepath)
 
     def load(self, filepath):
@@ -208,23 +217,23 @@ class HybridTradingAgent:
             state, ppo_output["action"], reward, ppo_output["value"], ppo_output["logprob"]
         )
 
-    def train_step(self, batch_size=32):
+    def train_step(self, batch_size=32, next_state=None):
+        """One learning tick. ``next_state`` bootstraps PPO's GAE (0 if omitted)."""
         self.step += 1
         self.dqn_agent.replay(batch_size)
         if self.step % 64 == 0 and len(self.ppo_agent.reward_buffer) > 0:
-            next_value = self.ppo_agent.get_value(
-                np.zeros((1, self.state_size), dtype=np.float32)
-            )
+            next_value = (self.ppo_agent.get_value(next_state)
+                          if next_state is not None else 0.0)
             adv, ret, states = self.ppo_agent.compute_gae(next_value)
             self.ppo_agent.train(adv, ret, states)
 
-    def save_models(self, models_dir="./models"):
+    def save_models(self, models_dir=MODELS_DIR):
         os.makedirs(models_dir, exist_ok=True)
-        self.dqn_agent.save(os.path.join(models_dir, "dqn_model.pkl"))
-        self.ppo_agent.save(os.path.join(models_dir, "ppo_model.pkl"))
+        self.dqn_agent.save(os.path.join(models_dir, "dqn_model.npz"))
+        self.ppo_agent.save(os.path.join(models_dir, "ppo_model.npz"))
         logger.info("Models saved to %s", models_dir)
 
-    def load_models(self, models_dir="./models"):
-        self.dqn_agent.load(os.path.join(models_dir, "dqn_model.pkl"))
-        self.ppo_agent.load(os.path.join(models_dir, "ppo_model.pkl"))
+    def load_models(self, models_dir=MODELS_DIR):
+        self.dqn_agent.load(os.path.join(models_dir, "dqn_model.npz"))
+        self.ppo_agent.load(os.path.join(models_dir, "ppo_model.npz"))
         logger.info("Models loaded from %s", models_dir)
